@@ -1,0 +1,101 @@
+name: 一分鐘探測
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: 一、機器與開發工具版本
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "===== 系統版本 ====="
+          sw_vers
+          uname -m
+          echo "核心數 $(sysctl -n hw.ncpu)  記憶體 $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          echo "===== 預設開發工具 ====="
+          xcodebuild -version
+          xcode-select -p
+          echo "===== 這台機器裝了哪些開發工具 ====="
+          ls -d /Applications/Xcode*.app
+
+      - name: 二、清理前的磁碟狀況
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "===== 清理前 ====="
+          df -h /
+          df -g /
+          echo "===== 空間被誰佔用 ====="
+          sudo du -sh /Applications/Xcode*.app 2>/dev/null | sort -h || true
+          echo "===== 本機快照（會把空間算成已用，刪檔案要不回來）====="
+          sudo tmutil listlocalsnapshots / || true
+          echo "===== 模擬器執行環境 ====="
+          xcrun simctl runtime list || true
+
+      - name: 三、實際清理並量出每一招回收多少
+        shell: bash
+        run: |
+          set -uo pipefail
+          B=$(df -g / | awk 'NR==2{print $4}'); echo "起始可用 ${B} GB"
+
+          echo "--- (a) 安卓工具包 ---"
+          sudo rm -rf "$HOME/Library/Android" "$HOME/.gradle" "$HOME/.android" "$HOME/hostedtoolcache" /usr/local/lib/android || true
+          A1=$(df -g / | awk 'NR==2{print $4}'); echo "可用 ${A1} GB（這招回收 $((A1-B)) GB）"
+
+          echo "--- (b) 用不到的開發工具版本（保留 15.4）---"
+          for app in /Applications/Xcode_*.app; do
+            [ "$app" = "/Applications/Xcode_15.4.app" ] && continue
+            echo "刪除 $app"; sudo rm -rf "$app" &
+          done
+          wait
+          A2=$(df -g / | awk 'NR==2{print $4}'); echo "可用 ${A2} GB（這招回收 $((A2-A1)) GB）"
+
+          echo "--- (c) 模擬器的實體檔案 ---"
+          sudo rm -rf /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime \
+                      "$HOME/Library/Developer/CoreSimulator/Caches" \
+                      "$HOME/Library/Developer/CoreSimulator/Devices" \
+                      /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          A3=$(df -g / | awk 'NR==2{print $4}'); echo "可用 ${A3} GB（這招回收 $((A3-A2)) GB）"
+
+          echo "--- (d) 模擬器管理指令（研究說幾乎沒用，量一下確認）---"
+          sudo xcrun simctl runtime delete all || true
+          xcrun simctl delete all || true
+          A4=$(df -g / | awk 'NR==2{print $4}'); echo "可用 ${A4} GB（這招回收 $((A4-A3)) GB）"
+
+          echo "===== 清理後 ====="
+          df -h /
+          df -g /
+          echo "★ 總共回收 $((A4-B)) GB，最終可用 ${A4} GB ★"
+
+      - name: 四、確認清理沒有把工具鏈弄壞
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_15.4.app
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          ls -d /Applications/Xcode*.app
+          df -g /
+
+      - name: 五、量從伺服器下載的速度
+        shell: bash
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+        run: |
+          set -uo pipefail
+          if [ -z "${ARCHIVE_URL}" ]; then echo "還沒設定下載網址，略過這一步"; exit 0; fi
+          echo "--- 不帶密碼，應該被擋（期望 401）---"
+          curl -s -o /dev/null -w '%{http_code}\n' --resolve "$ARCHIVE_RESOLVE" "$ARCHIVE_URL" || true
+          echo "--- 帶密碼取前 1024 位元組（期望 206，代表支援續傳）---"
+          curl -s -o /dev/null -w '%{http_code} 收到 %{size_download}\n' -r 0-1023 \
+               -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" "$ARCHIVE_URL" || true
+          echo "--- 抓 200 MB 量速度 ---"
+          curl -s -o /dev/null -w '收到 %{size_download} 位元組 用時 %{time_total} 秒 平均 %{speed_download} 位元組每秒\n' \
+               -r 0-209715199 -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" "$ARCHIVE_URL" || true
