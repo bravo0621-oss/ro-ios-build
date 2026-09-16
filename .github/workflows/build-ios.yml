@@ -125,7 +125,7 @@ jobs:
             if [ -z "${!v}" ]; then echo "::error::機密設定 $v 是空的"; exit 1; fi
           done
 
-          SCRIPT_URL="${ARCHIVE_URL%/*}/build_on_mac.sh"
+          KIT_URL="${ARCHIVE_URL%/*}/mac_kit.tar.gz"
 
           echo "開始下載（約兩 GB）"
           date -u
@@ -145,9 +145,9 @@ jobs:
           curl -fsS --retry 5 --retry-delay 5 \
                -u "$ARCHIVE_USER:$ARCHIVE_PASS" \
                --resolve "$ARCHIVE_RESOLVE" \
-               -o "$RUNNER_TEMP/build_on_mac.sh" "$SCRIPT_URL"
-          bash -n "$RUNNER_TEMP/build_on_mac.sh"
-          echo "編譯腳本下載完成且語法正確"
+               -o "$RUNNER_TEMP/mac_kit.tar.gz" "$KIT_URL"
+          tar -tzf "$RUNNER_TEMP/mac_kit.tar.gz" > /dev/null
+          echo "工具包下載完成且內容可讀"
           df -h /
 
       # ------------------------------------------------------------------
@@ -168,11 +168,19 @@ jobs:
           [ -d "$RO/xcode" ] || { echo "::error::找不到專案資料夾"; ls -la "$RO"; exit 1; }
           [ -d "$RO/mac_kit" ] || { echo "::error::找不到工具包資料夾"; ls -la "$RO"; exit 1; }
 
-          # 換上修改過的編譯腳本
-          cp "$RUNNER_TEMP/build_on_mac.sh" "$RO/mac_kit/build_on_mac.sh"
+          # 用修正過的工具包整個換掉壓縮檔裡那一份
+          rm -rf "$RO/mac_kit"
+          mkdir -p "$RO/mac_kit"
+          tar -xzf "$RUNNER_TEMP/mac_kit.tar.gz" -C "$RO/mac_kit"
           for need in 'ARCHS=arm64' 'VALID_ARCHS=arm64' 'DEBUG_INFORMATION_FORMAT=dwarf' '-derivedDataPath' 'MIN_FREE_GB'; do
             grep -q -- "$need" "$RO/mac_kit/build_on_mac.sh" || { echo "::error::腳本裡缺少 $need"; exit 1; }
           done
+          # 蘋果的舊版命令列會把緊接在變數後面的中文併進變數名稱，
+          # 必須確認工具包已經改成大括號寫法，否則會編到一半才中斷
+          grep -q '${MODE}' "$RO/mac_kit/core/build_ro_ios_core.sh" \
+            || { echo "::error::工具包不是修正過的版本"; exit 1; }
+          # 每支腳本先做語法檢查，有問題現在就知道
+          find "$RO/mac_kit" -name '*.sh' -print0 | xargs -0 -n1 bash -n
           find "$RO" -name '*.sh' -exec chmod +x {} +
 
           # 從 Linux 打包、在 macOS 解開，只差大小寫的檔案會互相覆蓋且不會報錯
