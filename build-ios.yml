@@ -1,0 +1,285 @@
+# ============================================================================
+# 愛如初見 — 產生未簽章的 iPhone 安裝檔
+#
+# 重要提醒：這台機器是目前唯一還內建我們需要的舊版開發工具的機器，
+#           已被列入淘汰：十月五日起會有多段時間直接讓工作失敗，
+#           十一月二日之後永久停用。這件事要在九月內做完。
+# ============================================================================
+name: 建置未簽章 iPhone 安裝檔
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 350
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_15.4.app/Contents/Developer
+      KEEP_XCODE: /Applications/Xcode_15.4.app
+      IOS_MIN: "12.0"
+      JOBS: "2"
+      XJOBS: "2"
+      EXPECT_BYTES: "2117005373"
+      ARCHIVE_SHA256: "3eef8276d8adc7834401c635a9001bf735f22a0c107d799539b6fba8b2bbe93d"
+      # 探測實測：清理後可用約 150 GB，所以維持保守的門檻即可
+      HARD_MIN_GB: "40"
+      MIN_FREE_GB: "35"
+
+    steps:
+      # ------------------------------------------------------------------
+      # 一、確認拿到的機器與開發工具版本是我們要的，不對就立刻停
+      # ------------------------------------------------------------------
+      - name: 一、確認機器與開發工具版本
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          echo "核心數 $(sysctl -n hw.ncpu)  記憶體 $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          ls -d /Applications/Xcode*.app
+          if [ ! -d "$KEEP_XCODE" ]; then
+            echo "::error::找不到要保留的那套開發工具，這台機器不是預期的版本，中止"
+            exit 1
+          fi
+          sudo xcode-select -s "$KEEP_XCODE"
+          xcodebuild -version
+          MAJOR="$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1)"
+          if [ "$MAJOR" != "15" ]; then
+            echo "::error::開發工具主版本是 $MAJOR，不是 15，中止"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 二、清出磁碟空間。刪除指令對不存在的路徑一律回報成功，
+      #     所以唯一可信的判準是「前後空間差值」，不是指令的回傳值。
+      # ------------------------------------------------------------------
+      - name: 二、清出磁碟空間
+        shell: bash
+        run: |
+          set -uo pipefail
+          df -h /
+          B=$(df -g / | awk 'NR==2{print $4}'); echo "清理前可用 ${B} GB"
+
+          sudo rm -rf "$HOME/Library/Android" "$HOME/.gradle" "$HOME/.android" \
+                      "$HOME/hostedtoolcache" /usr/local/lib/android || true
+
+          for app in /Applications/Xcode_*.app; do
+            [ "$app" = "$KEEP_XCODE" ] && continue
+            echo "刪除 $app"; sudo rm -rf "$app" &
+          done
+          wait
+
+          sudo rm -rf /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime \
+                      "$HOME/Library/Developer/CoreSimulator/Caches" \
+                      "$HOME/Library/Developer/CoreSimulator/Devices" \
+                      /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          sudo xcrun simctl runtime delete all || true
+          xcrun simctl delete all || true
+          sudo rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+          brew cleanup -s >/dev/null 2>&1 || true
+
+          df -h /
+          A=$(df -g / | awk 'NR==2{print $4}')
+          echo "清理後可用 ${A} GB（回收 $((A-B)) GB）"
+          if [ "$A" -le "$B" ]; then
+            echo "::error::完全沒有回收到空間，機器的資料夾命名可能已經改變"
+            sudo du -sh /Applications/* 2>/dev/null | sort -h | tail -20 || true
+            exit 1
+          fi
+          echo "FREE_GB=${A}" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 三、大量刪除之後，確認工具鏈還是好的（獨立一步，一失敗就停）
+      # ------------------------------------------------------------------
+      - name: 三、確認開發工具仍完好
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          FREE="$(df -g / | awk 'NR==2{print $4}')"
+          echo "目前可用 ${FREE} GB（至少要 ${HARD_MIN_GB} GB）"
+          if [ "$FREE" -lt "$HARD_MIN_GB" ]; then
+            echo "::error::只剩 ${FREE} GB，投入編譯也會在半路失敗，提前中止"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 四、從自己的伺服器下載專案素材與編譯腳本
+      #     走直連、不經過中介，因為中介對大檔有限制而且沒有任何好處
+      # ------------------------------------------------------------------
+      - name: 四、下載專案素材（大小與指紋雙重驗證）
+        shell: bash
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+        run: |
+          set -euo pipefail
+          for v in ARCHIVE_URL ARCHIVE_USER ARCHIVE_PASS ARCHIVE_RESOLVE; do
+            if [ -z "${!v}" ]; then echo "::error::機密設定 $v 是空的"; exit 1; fi
+          done
+
+          SCRIPT_URL="${ARCHIVE_URL%/*}/build_on_mac.sh"
+
+          echo "開始下載（約兩 GB）"
+          date -u
+          curl -fsS --retry 5 --retry-delay 10 -C - \
+               --speed-limit 524288 --speed-time 120 \
+               -u "$ARCHIVE_USER:$ARCHIVE_PASS" \
+               --resolve "$ARCHIVE_RESOLVE" \
+               -o "$RUNNER_TEMP/ro.tar.gz" "$ARCHIVE_URL"
+          date -u
+
+          ACTUAL="$(stat -f%z "$RUNNER_TEMP/ro.tar.gz")"
+          echo "收到 ${ACTUAL} 位元組，預期 ${EXPECT_BYTES} 位元組"
+          [ "$ACTUAL" = "$EXPECT_BYTES" ] || { echo "::error::檔案不完整"; exit 1; }
+          echo "${ARCHIVE_SHA256}  $RUNNER_TEMP/ro.tar.gz" | shasum -a 256 -c -
+          echo "大小與指紋都通過"
+
+          curl -fsS --retry 5 --retry-delay 5 \
+               -u "$ARCHIVE_USER:$ARCHIVE_PASS" \
+               --resolve "$ARCHIVE_RESOLVE" \
+               -o "$RUNNER_TEMP/build_on_mac.sh" "$SCRIPT_URL"
+          bash -n "$RUNNER_TEMP/build_on_mac.sh"
+          echo "編譯腳本下載完成且語法正確"
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 五、解壓縮並做事前檢查：讓注定失敗的設定在幾分鐘內失敗，
+      #     而不是編到第八十分鐘才爆掉
+      # ------------------------------------------------------------------
+      - name: 五、解壓縮並做事前檢查
+        shell: bash
+        run: |
+          set -euo pipefail
+          RO="$RUNNER_TEMP/ro"
+          mkdir -p "$RO"
+          tar -xzf "$RUNNER_TEMP/ro.tar.gz" -C "$RO"
+          rm -f "$RUNNER_TEMP/ro.tar.gz"
+          df -h /
+          echo "RO_ROOT=${RO}" >> "$GITHUB_ENV"
+
+          [ -d "$RO/xcode" ] || { echo "::error::找不到專案資料夾"; ls -la "$RO"; exit 1; }
+          [ -d "$RO/mac_kit" ] || { echo "::error::找不到工具包資料夾"; ls -la "$RO"; exit 1; }
+
+          # 換上修改過的編譯腳本
+          cp "$RUNNER_TEMP/build_on_mac.sh" "$RO/mac_kit/build_on_mac.sh"
+          for need in 'ARCHS=arm64' 'VALID_ARCHS=arm64' 'DEBUG_INFORMATION_FORMAT=dwarf' '-derivedDataPath' 'MIN_FREE_GB'; do
+            grep -q -- "$need" "$RO/mac_kit/build_on_mac.sh" || { echo "::error::腳本裡缺少 $need"; exit 1; }
+          done
+          find "$RO" -name '*.sh' -exec chmod +x {} +
+
+          # 從 Linux 打包、在 macOS 解開，只差大小寫的檔案會互相覆蓋且不會報錯
+          echo "解壓後檔案總數 $(find "$RO" -type f | wc -l)"
+          N="$(ls "$RO/xcode/Classes/Native" | wc -l | tr -d ' ')"
+          echo "原生程式碼檔數 ${N}（來源端是 811）"
+          [ "$N" -ge 800 ] || { echo "::error::原生程式碼檔數不對，解壓可能有檔案互相覆蓋"; exit 1; }
+
+          # 缺了這個檔案會編得過、裝得上、但一開就閃退
+          META="$(find "$RO/xcode" -name 'global-metadata.dat' | head -1 || true)"
+          [ -n "$META" ] || { echo "::error::找不到執行期必要檔案，做出來一開就會閃退"; exit 1; }
+          ls -lh "$META"
+
+          # 封存動作一定要有 scheme，而且沒有任何指令能事後補出來
+          cd "$RO/xcode"
+          xcodebuild -list -project Unity-iPhone.xcodeproj | tee "$RUNNER_TEMP/list.txt"
+          grep -q 'Unity-iPhone' "$RUNNER_TEMP/list.txt" || { echo "::error::專案裡沒有可用的建置方案"; exit 1; }
+
+          echo "::group::專案內各程式庫的架構"
+          find "$RO/xcode" -name '*.a' -print0 | while IFS= read -r -d '' f; do
+            printf '== %s\n' "${f#$RO/}"; lipo -info "$f" 2>/dev/null || true
+          done
+          echo "::endgroup::"
+
+      # ------------------------------------------------------------------
+      # 六、開始編譯。這一步最久，大約一到三小時。
+      #     一定要開 pipefail，否則編譯失敗會被「同時寫日誌」洗成成功
+      # ------------------------------------------------------------------
+      - name: 六、編譯並封裝
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          date -u
+          "$RO_ROOT/mac_kit/build_on_mac.sh" "$RO_ROOT/xcode" "$RUNNER_TEMP/out" \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+          date -u
+          df -h /
+
+      # ------------------------------------------------------------------
+      # 七、驗證做出來的是給實體手機用的，不是模擬器用的
+      #     （兩者的架構長得一模一樣，只看架構會放行裝不進手機的檔案）
+      # ------------------------------------------------------------------
+      - name: 七、驗證安裝檔
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA="$RUNNER_TEMP/out/ro_unsigned.ipa"
+          [ -f "$IPA" ] || { echo "::error::沒有產出安裝檔"; ls -la "$RUNNER_TEMP/out" || true; exit 1; }
+          ls -lh "$IPA"
+          SIZE="$(stat -f%z "$IPA")"
+          echo "安裝檔大小 ${SIZE} 位元組"
+          [ "$SIZE" -gt 20000000 ] || { echo "::error::安裝檔太小，是空殼"; exit 1; }
+
+          unzip -p "$IPA" 'Payload/*.app/Info.plist' > "$RUNNER_TEMP/Info.plist"
+          BIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$RUNNER_TEMP/Info.plist")"
+          echo "最低支援系統 $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$RUNNER_TEMP/Info.plist")"
+          unzip -p "$IPA" "Payload/*.app/${BIN}" > "$RUNNER_TEMP/mainbin"
+          vtool -show-build "$RUNNER_TEMP/mainbin" | tee "$RUNNER_TEMP/vtool.txt"
+          grep -qi 'platform[[:space:]]*IOS$' "$RUNNER_TEMP/vtool.txt" \
+            || grep -qi 'platform IOS' "$RUNNER_TEMP/vtool.txt" \
+            || { echo "::error::這不是給實體手機用的版本"; exit 1; }
+          rm -f "$RUNNER_TEMP/mainbin"
+          shasum -a 256 "$IPA" | tee "$RUNNER_TEMP/ipa.sha256"
+
+      # ------------------------------------------------------------------
+      # 八、把安裝檔傳回自己的伺服器。
+      #     不走平台的成品寄存，因為這個安裝檔大約兩 GB，免費方案放不下。
+      # ------------------------------------------------------------------
+      - name: 八、把安裝檔傳回伺服器
+        shell: bash
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+        run: |
+          set -euo pipefail
+          BASE="$(dirname "$ARCHIVE_URL" | sed 's#/iosbuild/#/iosupload/#')"
+          date -u
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+                 --retry 3 --retry-delay 15 \
+                 -u "$ARCHIVE_USER:$ARCHIVE_PASS" \
+                 --resolve "$ARCHIVE_RESOLVE" \
+                 -T "$RUNNER_TEMP/out/ro_unsigned.ipa" "$BASE/ro_unsigned.ipa")
+          echo "上傳安裝檔回應 $CODE"
+          [ "$CODE" = "201" ] || [ "$CODE" = "204" ] || { echo "::error::安裝檔回傳失敗"; exit 1; }
+
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+                 -u "$ARCHIVE_USER:$ARCHIVE_PASS" \
+                 --resolve "$ARCHIVE_RESOLVE" \
+                 -T "$RUNNER_TEMP/ipa.sha256" "$BASE/ro_unsigned.ipa.sha256")
+          echo "上傳指紋回應 $CODE"
+          date -u
+
+      # ------------------------------------------------------------------
+      # 九、日誌無論成功失敗都要留下來，失敗時這是唯一的線索
+      # ------------------------------------------------------------------
+      - name: 九、上傳建置日誌
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/list.txt
+            ${{ runner.temp }}/vtool.txt
+            ${{ runner.temp }}/ipa.sha256
+          if-no-files-found: warn
+          retention-days: 7
