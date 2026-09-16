@@ -73,12 +73,10 @@ jobs:
           done
           wait
 
-          sudo rm -rf /System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime \
-                      "$HOME/Library/Developer/CoreSimulator/Caches" \
-                      "$HOME/Library/Developer/CoreSimulator/Devices" \
-                      /Library/Developer/CoreSimulator/Profiles/Runtimes || true
-          sudo xcrun simctl runtime delete all || true
-          xcrun simctl delete all || true
+          # 注意：這裡刻意「不」去刪模擬器執行環境與平台元件。
+          # 第三、四輪就是因為刪了它們，蘋果工具認定「iOS 平台沒安裝」，
+          # 在最後打包時找不到任何可用的目標裝置而失敗。
+          # 光是刪安卓工具包與用不到的開發工具版本就有八十幾 GB，遠超過需要的四十 GB。
           sudo rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
           brew cleanup -s >/dev/null 2>&1 || true
 
@@ -198,6 +196,30 @@ jobs:
           cd "$RO/xcode"
           xcodebuild -list -project Unity-iPhone.xcodeproj | tee "$RUNNER_TEMP/list.txt"
           grep -q 'Unity-iPhone' "$RUNNER_TEMP/list.txt" || { echo "::error::專案裡沒有可用的建置方案"; exit 1; }
+
+          # 最後打包一定要找得到「任一台 iPhone 實機」這個目標。
+          # 這一步只花幾秒，卻能在投入十六分鐘編譯之前就攔下第三、四輪那種失敗。
+          dest_ok() {
+            xcodebuild -project Unity-iPhone.xcodeproj -scheme Unity-iPhone \
+              -showdestinations > "$RUNNER_TEMP/dest.txt" 2>&1 || true
+            awk '/Available destinations/,0' "$RUNNER_TEMP/dest.txt" | grep -q 'platform:iOS'
+          }
+
+          if ! dest_ok; then
+            echo "找不到可用的實機目標，嘗試補裝 iOS 平台元件（可能要幾分鐘）"
+            sudo xcodebuild -downloadPlatform iOS || true
+            if ! dest_ok; then
+              echo "::group::目標清單"
+              cat "$RUNNER_TEMP/dest.txt"
+              echo "::endgroup::"
+              echo "::error::補裝後仍然找不到可用的實機目標，這一輪不必再往下跑"
+              exit 1
+            fi
+            echo "補裝後已經找得到實機目標"
+          fi
+          echo "::group::可用的打包目標"
+          cat "$RUNNER_TEMP/dest.txt"
+          echo "::endgroup::"
 
           echo "::group::專案內各程式庫的架構"
           find "$RO/xcode" -name '*.a' -print0 | while IFS= read -r -d '' f; do
