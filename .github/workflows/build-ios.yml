@@ -46,8 +46,12 @@ jobs:
             exit 1
           fi
           sudo xcode-select -s "$KEEP_XCODE"
-          xcodebuild -version
-          MAJOR="$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1)"
+          # 先把版本資訊整個接下來再解析。
+          # 不能寫成 xcodebuild -version | head -1 —— head 讀到第一行就關掉管線，
+          # xcodebuild 會因為管線中斷而拋出例外並結束，讓這一步無故失敗。
+          XB_VER="$(xcodebuild -version)"
+          printf '%s\n' "$XB_VER"
+          MAJOR="$(printf '%s\n' "$XB_VER" | awk 'NR==1{split($2,a,"."); print a[1]}')"
           if [ "$MAJOR" != "15" ]; then
             echo "::error::開發工具主版本是 $MAJOR，不是 15，中止"
             exit 1
