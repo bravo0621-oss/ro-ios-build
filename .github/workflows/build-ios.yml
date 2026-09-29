@@ -24,8 +24,8 @@ jobs:
       IOS_MIN: "12.0"
       JOBS: "2"
       XJOBS: "2"
-      EXPECT_BYTES: "2567797876"
-      ARCHIVE_SHA256: "fff10251fb91b932d9ef41d36e880b35a4d840a3d20ddc10416ae3967e2a689b"
+      EXPECT_BYTES: "2516780062"
+      ARCHIVE_SHA256: "c10af8603251537eb48585d98de3a2cff0c45a0848d88c032a3de6113ee99a3e"
       # 探測實測：清理後可用約 150 GB，所以維持保守的門檻即可
       HARD_MIN_GB: "40"
       MIN_FREE_GB: "35"
