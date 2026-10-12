@@ -53,7 +53,7 @@ jobs:
           MODE: ${{ github.event.inputs.mode }}
         run: |
           set -eu
-          W="$RUNNER_TEMP/w"; mkdir -p "$W/kit" "$W/game"
+          W="$(cygpath -u "$RUNNER_TEMP")/w"; mkdir -p "$W/kit" "$W/game"
           BASE="$(dirname "$ARCHIVE_URL")"
           curl -fsS --retry 5 -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" -o "$W/kit.tgz" "$BASE/win_inst_kit.tar.gz"
           echo "$KIT_SHA256  $W/kit.tgz" | sha256sum -c -
@@ -63,7 +63,7 @@ jobs:
           if [ "$MODE" = "build" ]; then
             curl -fsS --retry 5 -C - -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" -o "$W/game.zip" "$BASE/win_game.zip"
             echo "$GAME_SHA256  $W/game.zip" | sha256sum -c -
-            7z x -y -o"$W/game" "$W/game.zip" > /dev/null
+            7z x -y -o"$(cygpath -w "$W/game")" "$(cygpath -w "$W/game.zip")" > /dev/null
             rm -f "$W/game.zip"
             [ -f "$W/game/CJ2RO.exe" ] || { echo "::error::遊戲資料夾裡沒有 CJ2RO.exe"; exit 1; }
           else
@@ -94,7 +94,7 @@ jobs:
           ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
         run: |
           set -eu
-          W="$RUNNER_TEMP/w"; mkdir -p "$W/out"
+          W="$(cygpath -u "$RUNNER_TEMP")/w"; mkdir -p "$W/out"
           cp "$W/iscc.log" "$W/out/" 2>/dev/null || true
           ( cd "$W/out" && sha256sum * > sha256.txt )
           tar czf "$W/win_inst_out.tar.gz" -C "$W" out
