@@ -1,0 +1,107 @@
+# ============================================================================
+# 初見2仙境 — 電腦版（Windows x64）核心程式庫 rocommongamelibs.dll / rogamelibs.dll
+#
+# 照 iPhone 版做法：這個公開儲存庫裡「沒有任何原始碼」，編譯時才用機密設定裡的帳密
+# 從我們自己的主機下載工具包；編好的成品與完整紀錄也直接傳回我們的主機，不放在這裡。
+# 畫面紀錄是公開的，所以只印進度、數量與檔名，不印原始碼內容或編譯錯誤細節。
+# ============================================================================
+name: 建置電腦版核心程式庫
+
+on:
+  workflow_dispatch:
+    inputs:
+      kit_sha256:
+        description: "工具包 win_kit.tar.gz 的 SHA-256"
+        required: true
+      kit_bytes:
+        description: "工具包大小（位元組）"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: 一、安裝編譯工具（MSYS2 CLANG64）
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: false
+          install: >-
+            make tar curl
+            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+
+      - name: 二、確認工具版本
+        run: |
+          set -eu
+          clang --version | head -1
+          ld.lld --version | head -1
+          cmake --version | head -1
+          echo "核心數 $(nproc)"
+
+      - name: 三、從我們主機下載工具包（大小與指紋雙重驗證）
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+          KIT_SHA256: ${{ github.event.inputs.kit_sha256 }}
+          KIT_BYTES: ${{ github.event.inputs.kit_bytes }}
+        run: |
+          set -eu
+          for v in ARCHIVE_URL ARCHIVE_USER ARCHIVE_PASS ARCHIVE_RESOLVE; do
+            if [ -z "${!v}" ]; then echo "::error::機密設定 $v 是空的"; exit 1; fi
+          done
+          W="$(cygpath -u "$RUNNER_TEMP")/w"; mkdir -p "$W"
+          KIT_URL="$(dirname "$ARCHIVE_URL")/win_kit.tar.gz"
+          curl -fsS --retry 5 --retry-delay 10 -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" \
+               -o "$W/win_kit.tar.gz" "$KIT_URL"
+          ACTUAL="$(stat -c %s "$W/win_kit.tar.gz")"
+          echo "收到 $ACTUAL 位元組，預期 $KIT_BYTES"
+          [ "$ACTUAL" = "$KIT_BYTES" ] || { echo "::error::大小不符"; exit 1; }
+          echo "$KIT_SHA256  $W/win_kit.tar.gz" | sha256sum -c -
+          tar xzf "$W/win_kit.tar.gz" -C "$W"
+          rm -f "$W/win_kit.tar.gz"
+          ls "$W"
+
+      - name: 四、編譯與驗證
+        id: build
+        continue-on-error: true
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP")/w"
+          JOBS=4 bash "$W/kit/build_win_core.sh" "$W"
+
+      - name: 五、成品與紀錄傳回我們主機（成功失敗都傳）
+        if: always()
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+        run: |
+          set -eu
+          W="$(cygpath -u "$RUNNER_TEMP")/w"
+          [ -d "$W/out" ] || { echo "::error::沒有產出資料夾"; exit 1; }
+          tar czf "$W/win_core_out.tar.gz" -C "$W" out
+          sha256sum "$W/win_core_out.tar.gz"
+          BASE="$(dirname "$ARCHIVE_URL" | sed 's#/iosbuild/#/iosupload/#')"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 15 \
+                 -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" \
+                 -T "$W/win_core_out.tar.gz" "$BASE/win_core_out_${GITHUB_RUN_ID}.tar.gz")
+          echo "傳回回應 $CODE"
+          [ "$CODE" = "201" ] || [ "$CODE" = "204" ] || { echo "::error::傳回失敗"; exit 1; }
+
+      - name: 六、結果
+        if: always()
+        run: |
+          if [ "${{ steps.build.outcome }}" != "success" ]; then echo "::error::編譯或驗證沒有通過，詳細紀錄已傳回主機"; exit 1; fi
+          echo "全部通過"
