@@ -1,0 +1,111 @@
+# ============================================================================
+# 初見2仙境 — 電腦版安裝程式（Inno Setup，免費）
+# 同 iPhone 版做法：這個公開儲存庫沒有任何遊戲檔或原始碼；編譯時才用機密設定的帳密從我們主機下載，
+# 成品直接傳回我們主機，不放這裡。
+#   mode=check：只用假的遊戲資料夾編一次，確認安裝程式腳本沒寫錯（不需要遊戲檔）
+#   mode=build：下載匯出好的遊戲資料夾（win_game.zip），編出正式安裝程式傳回主機
+# ============================================================================
+name: 建置電腦版安裝程式
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check 或 build"
+        required: true
+        default: "check"
+      kit_sha256:
+        description: "安裝程式素材 win_inst_kit.tar.gz 的 SHA-256"
+        required: true
+      game_sha256:
+        description: "（build 才要）win_game.zip 的 SHA-256"
+        required: false
+      app_ver:
+        description: "安裝程式版本"
+        required: true
+        default: "0.3.0.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 一、安裝 Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if (!(Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { Write-Error "沒有 ISCC"; exit 1 }
+
+      - name: 二、從我們主機下載素材
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+          KIT_SHA256: ${{ github.event.inputs.kit_sha256 }}
+          GAME_SHA256: ${{ github.event.inputs.game_sha256 }}
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"; mkdir -p "$W/kit" "$W/game"
+          BASE="$(dirname "$ARCHIVE_URL")"
+          curl -fsS --retry 5 -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" -o "$W/kit.tgz" "$BASE/win_inst_kit.tar.gz"
+          echo "$KIT_SHA256  $W/kit.tgz" | sha256sum -c -
+          tar xzf "$W/kit.tgz" -C "$W/kit"
+          curl -fsS --retry 5 -o "$W/kit/ChineseTraditional.isl" \
+            "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseTraditional.isl"
+          if [ "$MODE" = "build" ]; then
+            curl -fsS --retry 5 -C - -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" -o "$W/game.zip" "$BASE/win_game.zip"
+            echo "$GAME_SHA256  $W/game.zip" | sha256sum -c -
+            7z x -y -o"$W/game" "$W/game.zip" > /dev/null
+            rm -f "$W/game.zip"
+            [ -f "$W/game/CJ2RO.exe" ] || { echo "::error::遊戲資料夾裡沒有 CJ2RO.exe"; exit 1; }
+          else
+            # 假的遊戲資料夾：只為了確認腳本能編
+            cp /c/Windows/System32/whoami.exe "$W/game/CJ2RO.exe"
+            mkdir -p "$W/game/CJ2RO_Data/Plugins"; echo test > "$W/game/CJ2RO_Data/Plugins/readme.txt"
+          fi
+          ls "$W/kit"
+
+      - name: 三、編安裝程式
+        id: iscc
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $W = "$env:RUNNER_TEMP\w"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DSrcDir=$W\game" "/DAppVer=${{ github.event.inputs.app_ver }}" "/O$W\out" "$W\kit\cj2ro_setup.iss" *> "$W\iscc.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$W\iscc.log" -Tail 15
+          Get-ChildItem "$W\out" -ErrorAction SilentlyContinue | Format-Table Name, Length
+          exit $rc
+
+      - name: 四、成品與紀錄傳回主機
+        if: always()
+        env:
+          ARCHIVE_URL: ${{ secrets.ARCHIVE_URL }}
+          ARCHIVE_USER: ${{ secrets.ARCHIVE_USER }}
+          ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASS }}
+          ARCHIVE_RESOLVE: ${{ secrets.ARCHIVE_RESOLVE }}
+        run: |
+          set -eu
+          W="$RUNNER_TEMP/w"; mkdir -p "$W/out"
+          cp "$W/iscc.log" "$W/out/" 2>/dev/null || true
+          ( cd "$W/out" && sha256sum * > sha256.txt )
+          tar czf "$W/win_inst_out.tar.gz" -C "$W" out
+          BASE="$(dirname "$ARCHIVE_URL" | sed 's#/iosbuild/#/iosupload/#')"
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" \
+                 -T "$W/win_inst_out.tar.gz" "$BASE/win_inst_out_${GITHUB_RUN_ID}.tar.gz")
+          echo "傳回回應 $CODE"
+          [ "$CODE" = "201" ] || [ "$CODE" = "204" ]
+
+      - name: 五、結果
+        if: always()
+        run: |
+          if [ "${{ steps.iscc.outcome }}" != "success" ]; then echo "::error::安裝程式沒有編成功"; exit 1; fi
+          echo "安裝程式編譯成功"
