@@ -59,7 +59,7 @@ jobs:
           echo "$KIT_SHA256  $W/kit.tgz" | sha256sum -c -
           tar xzf "$W/kit.tgz" -C "$W/kit"
           curl -fsS --retry 5 -o "$W/kit/ChineseTraditional.isl" \
-            "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseTraditional.isl"
+            "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseTraditional.isl"
           if [ "$MODE" = "build" ]; then
             curl -fsS --retry 5 -C - -u "$ARCHIVE_USER:$ARCHIVE_PASS" --resolve "$ARCHIVE_RESOLVE" -o "$W/game.zip" "$BASE/win_game.zip"
             echo "$GAME_SHA256  $W/game.zip" | sha256sum -c -
