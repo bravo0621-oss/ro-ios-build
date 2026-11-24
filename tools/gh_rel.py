@@ -91,12 +91,36 @@ def releases():
             return out
         page += 1
 
-def find_draft(tag, must=True):
-    for r in releases():
-        if r.get('tag_name') == tag:
+def _cache(tag):
+    d = os.environ.get('RO_IOS_REL_CACHE', os.path.join(os.path.expanduser('~'), '.cache', 'ro_ios_rel'))
+    return os.path.join(d, tag + '.id')
+
+def _remember(tag, rid):
+    try:
+        f = _cache(tag); os.makedirs(os.path.dirname(f), exist_ok=True); open(f, 'w').write(str(rid))
+    except OSError:
+        pass
+
+def find_draft(tag, must=True, tries=6):
+    # r60_apk6：先用建立時記下的 id 直接取（剛建好的草稿列表可能還沒出現）
+    try:
+        rid = int(open(_cache(tag)).read().strip())
+        st, r = call('GET', '/repos/%s/releases/%d' % (REPO, rid), ok=(200, 404))
+        if st == 200 and isinstance(r, dict) and r.get('tag_name') == tag:
             if not r.get('draft'):
                 die('標籤 %s 的 Release 不是草稿（公開的），不動它' % tag)
             return r
+    except (OSError, ValueError):
+        pass
+    for i in range(tries):
+        for r in releases():
+            if r.get('tag_name') == tag:
+                if not r.get('draft'):
+                    die('標籤 %s 的 Release 不是草稿（公開的），不動它' % tag)
+                _remember(tag, r['id'])
+                return r
+        if i < tries - 1:
+            time.sleep(10)
     if must:
         die('找不到草稿 Release %s' % tag)
     return None
@@ -187,11 +211,11 @@ def main(argv):
         print('workflow：', ', '.join('%s(%s)' % (x['path'].split('/')[-1], x['state']) for x in w.get('workflows', [])) or '沒有')
         print('GH_CHECK_OK')
     elif cmd == 'create':
-        tag = args[0]; r = find_draft(tag, must=False)
+        tag = args[0]; r = find_draft(tag, must=False, tries=3)
         if r is None:
             _, rp = call('GET', '/repos/%s' % REPO)
             _, r = call('POST', '/repos/%s/releases' % REPO, {'tag_name': tag, 'name': tag, 'draft': True, 'target_commitish': rp['default_branch'], 'body': '下一服 iPhone 雲端編譯暫存（草稿，不公開；用完刪）'})
-            print('建好草稿', tag)
+            _remember(tag, r['id']); print('建好草稿', tag)
         else:
             print('沿用既有草稿', tag)
         print('DRAFT_OK', tag)
